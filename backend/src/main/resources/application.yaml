@@ -1,0 +1,21 @@
+server:
+  port: 8080
+  error:
+    include-stacktrace: never
+    include-message: never
+    include-binding-errors: never
+
+spring:
+  application:
+    name: backend
+  datasource:
+    url: ${POSTGRES_URL:jdbc:postgresql://localhost:5432/lp_db}
+    username: ${POSTGRES_USER:lp_user}
+    password: ${POSTGRES_PASSWORD:lp_password}
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    open-in-view: false
+  flyway:
+    enabled: true
+    locations: classpath:db/migration

@@ -16,14 +16,19 @@ The financial rules (account types, entry signs, overspend protection, failure b
 
 Each sprint ends with something that runs, a demo you can show, and passing tests. One week per sprint is assumed; stretch it to match the hours you actually have, but keep the sprint goals in this order.
 
-| Sprint | Goal | Stories | Pts | Demo at the end |
+**Working agreement: one vertical slice per sprint.** Each sprint delivers exactly one database table (a new Flyway migration), its entity and repository, the service/endpoint that uses it, and the tests for that slice — nothing else. The database schema grows one table at a time, in dependency order, instead of all six tables up front. Each table is an increment you can demo; the slice is done only when its tests pass against real PostgreSQL via Testcontainers.
+
+| Sprint | Slice (table → entity → API → test) | Stories | Pts | Demo at the end |
 | --- | --- | --- | --- | --- |
-| 0 | A running skeleton with a tested schema | US-1, US-2 | 8 | `docker compose up`, then a test proving the database rejects an unbalanced ledger and a ledger update |
-| 1 | Money can enter and leave an account | US-3, US-4, US-5, US-6 | 9 | Create an account, deposit, withdraw, and watch the ledger entries |
-| 2 | Money can move between accounts safely | US-7, US-8 | 7 | A transfer, a forced mid-transfer failure that rolls back, and the paged ledger |
-| 3 | Concurrency cannot corrupt balances | US-9, US-10 | 8 | The 100-parallel-withdrawals test and the opposite-transfers test, both green |
-| 4 | Retries and crashes are safe | US-11, US-12, US-13 | 10 | 20 identical parallel requests, one transaction; the crash-after-commit test |
-| 5 | Provable and presentable | US-14, US-15, US-16 | 8 | Corrupt a balance, run reconciliation, run the 10,000-transfer gate, show the README |
+| 0 | Skeleton + `accounts`: migration, `Account` entity + repository, `POST/GET /accounts`, Testcontainers test | US-1, US-2 | 8 | Create an account over HTTP, then read it back; the DB migration runs on `docker compose up` |
+| 1 | `ledger_entries` (+ minimal `transactions` parent): entities, repositories, repo tests | US-3 | 6 | Integration tests prove an entry inserts, links account + transaction, and rows are append-only |
+| 2 | `transactions` completed (`type`, `status`, `reverses_transaction_id`): posting service, `POST/GET /transactions` | US-4, US-5 | 6 | Insert a transaction with two zero-sum entries; failed posts leave zero rows |
+| 3 | Money enters and leaves: deposits and withdrawals on top of the posts slice | US-6, US-8 | 6 | Create an account, deposit, withdraw, and watch the paged ledger |
+| 4 | Transfers between accounts, with rollback and deadlock-safe locking | US-7, US-9 | 7 | A transfer, a forced mid-transfer failure that rolls back, and the opposite-transfers test |
+| 5 | `idempotency_keys`: entity, repository, key reuse in postings + retries | US-11, US-12, US-13 | 8 | 20 identical parallel requests, one transaction; the crash-after-commit test; key-misuse 422 |
+| 6 | Concurrency hardening of the posting slice (tests only, no new tables) | US-10 | 5 | The 100-parallel-withdrawals test and the opposite-transfers test, both green, ten runs in a row |
+| 7 | Reconciliation slice: reconciliation tables, service, admin endpoints | US-14, US-15 | 6 | Corrupt a balance, run reconciliation, see exactly that account reported |
+| 8 | Release gate: invariants I1–I7, the 10,000-transfer gate, README, AC checklist | US-16 | 5 | Run the full acceptance suite from a clean checkout and show the README |
 
 **Ceremonies, kept light for a solo project**
 
@@ -113,19 +118,22 @@ com.ledgerline
 
 ## API contract
 
-All money-moving endpoints require an `Idempotency-Key` header and amounts in whole paise.
+All money-moving endpoints require an `Idempotency-Key` header and amounts in whole paise. Every path is versioned under `/api/v1` (decided in Sprint 0, see `docs/decisions.md`).
 
 | Method and path | Purpose | Success |
 | --- | --- | --- |
-| `POST /accounts` | Create an account (`ownerName`, `type`) | 201 |
-| `GET /accounts/{id}` | Account and current balance | 200 |
-| `GET /accounts/{id}/ledger?before={entryId}&limit=50` | Ledger entries, newest first | 200 |
-| `POST /deposits` | `{accountId, amountPaise}` | 201 |
-| `POST /withdrawals` | `{accountId, amountPaise}` | 201 |
-| `POST /transfers` | `{fromAccountId, toAccountId, amountPaise}` | 201 |
-| `GET /transactions/{id}` | One transaction with its entries | 200 |
-| `POST /admin/reconciliation` | Run reconciliation now | 200 |
-| `GET /admin/reconciliation/latest` | Result of the latest run | 200 |
+| `POST /api/v1/accounts` | Create an account (`ownerName`, `type`) | 201 |
+| `GET /api/v1/accounts/{publicId}` | Account and current balance | 200 |
+| `GET /api/v1/accounts/{publicId}/ledger?before={entryId}&limit=50` | Ledger entries, newest first | 200 |
+| `POST /api/v1/deposits` | `{accountId, amountPaise}` | 201 |
+| `POST /api/v1/withdrawals` | `{accountId, amountPaise}` | 201 |
+| `POST /api/v1/transfers` | `{fromAccountId, toAccountId, amountPaise}` | 201 |
+| `GET /api/v1/transactions/{publicId}` | One transaction with its entries | 200 |
+| `POST /api/v1/admin/reconciliation` | Run reconciliation now | 200 |
+| `GET /api/v1/admin/reconciliation/latest` | Result of the latest run | 200 |
+
+`publicId` values are server-generated UUIDs. The client never supplies one; it receives it in the
+`201` response and uses it in every later call.
 
 **Error codes**
 
@@ -143,13 +151,38 @@ All money-moving endpoints require an `Idempotency-Key` header and amounts in wh
 
 The database holds six tables and enforces the money rules itself: balances cannot go negative, ledger rows cannot be edited or deleted, and each transaction's entries must sum to zero.
 
-&#91;embedded content: database schema · 6 tables\]
+The schema is built one table per sprint, in dependency order, so the exact DDL lives with the
+code that uses it rather than in this document:
+
+| Table | Added in | Migration |
+| --- | --- | --- |
+| `accounts` | Sprint 0 | `backend/src/main/resources/db/migration/V1__init.sql` |
+| `transactions` (minimal parent) | Sprint 1 | `V2__...` |
+| `ledger_entries` | Sprint 1 | `V2__...` |
+| `idempotency_keys` | Sprint 5 | `V3__...` |
+| `reconciliation_runs` | Sprint 7 | `V4__...` |
+| `reconciliation_findings` | Sprint 7 | `V4__...` |
 
 The ledger sits in the middle: every entry ties one account to one transaction, and idempotency keys and reconciliation results hang off those two.
 
+### Invariants
+
+These are the properties the whole project exists to protect. A change is not allowed to weaken
+any of them, and Sprint 8 turns each one into an automated check.
+
+| # | Invariant |
+| --- | --- |
+| I1 | The entries of a transaction sum to zero. Money is moved, never created or destroyed. |
+| I2 | A customer or merchant account never holds a negative balance. Only `SYSTEM_FUNDING` may. |
+| I3 | `ledger_entries` and `transactions` are append-only: `UPDATE` and `DELETE` are rejected by the database. |
+| I4 | The sum of all account balances is always zero. |
+| I5 | An account's stored balance equals the sum of that account's ledger entries. |
+| I6 | Each `public_id` identifies exactly one account, and each account has exactly one `public_id`. |
+| I7 | A transaction is posted all or nothing: either all of its entries are committed, or none are. |
+
 **Why it is shaped this way**
 
-- `balance_non_negative` makes overspending impossible at the database level, even if the application check is wrong.
+- `ck_accounts_negative_balance` makes overspending impossible at the database level, even if the application check is wrong.
 - The deferred trigger lets the code insert a transaction's entries one at a time; the zero-sum rule is checked once, at commit.
 - The unique `(client_id, idempotency_key)` constraint is what makes parallel duplicate requests safe: exactly one insert wins.
 - `idx_ledger_account_id_desc` serves the paged ledger query and the reconciliation sum per account.
